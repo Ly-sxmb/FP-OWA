@@ -2,6 +2,7 @@
 Pseudocode
 
 A.Overview
+
 Algorithm: FunctionalRankingPipeline
 Input:
     n_samples     // number of samples (e.g., 100)
@@ -29,6 +30,8 @@ Steps:
     6) Aggregate results and compute 95% confidence intervals (Module F).
 
 End
+
+
 
 B Data Module
 B1. Algorithm: GenerateFunctionalData
@@ -70,6 +73,7 @@ Convert raw_data into an fd object clean_fd using Data2fd (without additional sm
 Return: (clean_fd, t_points, basis, true_integrals, true_rank)
 End
 
+
 B2. Algorithm: AddPollution
 Input:
     fd_obj, type ∈ {gaussian, spike, amplitude, poisson, uniform, laplace, exponential}
@@ -91,8 +95,10 @@ Return:
     An fd object reconstructed using the same basis.
 End
 
+
+
 C.Ranking Methods
-C1. Algorithm: FPCA_
+C1. Algorithm: FPCA
 Input:
     fd_obj
 
@@ -155,7 +161,7 @@ Compute final overall ranks: ranks ← rank(total_scores, ties = average).
 Return: total_scores, ranks, seg_points, weights, segment_ranks
 End
 
-C3.Algorithm: FP-OWA_Modified
+C3.Algorithm: FP-OWA
 Input:
     fd_obj, t_length_for_eval, lambda_candidates (e.g., 10^seq(-6, 0))
 
@@ -208,6 +214,7 @@ Compute final ranking scores: scores ← segment_ranks · mbd_weights.
 Return: scores, seg_points, λ*
 End
 
+
 D.Algorithm: EvaluateRanking
 Input: true_ranks, pred_scores, true_integrals (optional)
 Output: metrics = {kendall_tau, spearman_rho, mard, top_consistency, bottom_consistency,
@@ -222,6 +229,7 @@ Steps:
 
 Return: metrics
 End
+
 
 E.Algorithm: RunSimulation
 Input:
@@ -251,6 +259,7 @@ Combine all result rows from every run into a single results_table.
 
 Return: results_table
 End
+
 
 F. Algorithm: SummarizeWithCI
 Input:
