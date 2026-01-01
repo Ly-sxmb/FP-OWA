@@ -1,1 +1,544 @@
+# ==============================================================================
+# Project: Comparison of Ranking Methods for Functional Data (FP-OWA Simulation)
+# Description: 
+#   This script reproduces the simulation study comparing the FP-OWA 
+#   method against other benchmark methods (WLR, FPCA, H-Mode, RTD).
+#   It includes data generation, pollution induction, method execution, 
+#   and parallel performance evaluation.
+#
+# Methods Compared:
+#   1. FP-OWA (Proposed)
+#   2. Weighted Linear Rank (WLR)
+#   3. Functional PCA (FPCA)
+#   4. H-Mode Depth
+#   5. Random Tukey Depth (RTD)
+#
+# Dependencies: 
+#   fda, dbscan, depthTools, ggplot2, doParallel, fda.usc, etc.
+# ==============================================================================
+
+# ------------------------------
+# 1. Setup and Dependencies
+# ------------------------------
+rm(list = ls()) # Clear environment
+
+# Check and load required packages
+required_packages <- c("fda", "dtwclust", "cluster", "roahd", "ggplot2", 
+                       "microbenchmark", "rootSolve", "dbscan", "extraDistr", 
+                       "LaplacesDemon", "stringr", "parallel", "foreach", 
+                       "doParallel", "fda.usc", "reshape2")
+
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+suppressPackageStartupMessages({
+  library(fda)            
+  library(dtwclust)       
+  library(cluster)
+  library(roahd)          
+  library(ggplot2)        
+  library(microbenchmark) 
+  library(rootSolve)      
+  library(dbscan)         
+  library(extraDistr)     
+  library(LaplacesDemon)
+  library(stringr)
+  library(parallel)
+  library(foreach)
+  library(doParallel)
+  library(fda.usc)        
+  library(reshape2)       
+})
+
+# ------------------------------
+# 2. Data Generation Module
+# ------------------------------
+
+# Generate synthetic functional data with ground truth
+generate_functional_data <- function(n, t_length = 50, noise_sd = 0) {
+  t <- seq(0, 1, length.out = t_length)
+  basis <- create.bspline.basis(rangeval = c(0, 1), nbasis = 8, norder = 4)
+  
+  # Generate true patterns (slope + sine wave)
+  true_patterns <- sapply(1:n, function(i) {
+    slope <- runif(1, 3.5, 4.5)   
+    phase <- runif(1, 0, 0.2)       
+    slope * t + sin(2 * pi * (t + phase))
+  })
+  
+  # Add white noise
+  raw_data <- true_patterns + matrix(rnorm(n * t_length, sd = noise_sd), nrow = t_length)
+  true_patterns_fd <- Data2fd(argvals = t, y = true_patterns, basisobj = basis)
+  
+  # Calculate True Ranks based on integrals
+  const_basis <- create.constant.basis(c(0,1))
+  const_fd <- fd(coef = 1, basisobj = const_basis)
+  
+  true_integrals <- numeric(n)
+  for(i in 1:n) {
+    true_integrals[i] <- inprod(true_patterns_fd[i], const_fd)
+  }
+  
+  true_rank <- rank(true_integrals, ties.method = "average")
+  raw_fd <- Data2fd(argvals = t, y = raw_data, basisobj = basis)
+  
+  list(
+    clean = raw_fd,
+    t_points = t,
+    basis = basis,
+    true_rank = true_rank,
+    true_integrals = true_integrals  
+  )
+}
+
+# Add specific types of pollution/noise to the curves
+add_pollution <- function(fd_obj, type = c("gaussian", "spike", "amplitude", "salt_and_pepper", "poisson", "uniform", "laplace", "exponential", "random_walk"), ...) {
+  coefs <- as.matrix(fd_obj$coefs)
+  type <- match.arg(type)
+  
+  switch(type,
+         "gaussian" = {
+           params <- list(...)
+           noise <- matrix(rnorm(ncol(coefs) * nrow(coefs), sd = params$sigma), nrow = nrow(coefs))
+           fd(coef = coefs + noise, basisobj = fd_obj$basis)
+         },
+         "spike" = {
+           params <- list(...)
+           n_spike <- round(params$ratio * ncol(coefs))
+           spike_idx <- sample(ncol(coefs), n_spike)
+           for(i in spike_idx) coefs[, i] <- coefs[, i] + 5
+           fd(coef = coefs, basisobj = fd_obj$basis)
+         },
+         "amplitude" = {
+           params <- list(...)
+           n_amp <- round(params$ratio * ncol(coefs))
+           amp_idx <- sample(ncol(coefs), n_amp)
+           coefs[, amp_idx] <- coefs[, amp_idx] * 2
+           fd(coef = coefs, basisobj = fd_obj$basis)
+         },
+         "poisson" = {
+           params <- list(...)
+           lambda <- params$lambda
+           poisson_noise <- matrix(rpois(ncol(coefs) * nrow(coefs), lambda = lambda), nrow = nrow(coefs))
+           fd(coef = coefs + poisson_noise, basisobj = fd_obj$basis)
+         },
+         "uniform" = {
+           params <- list(...)
+           lower_bound <- params$lower
+           upper_bound <- params$upper
+           uniform_noise <- matrix(runif(ncol(coefs) * nrow(coefs), min = lower_bound, max = upper_bound), nrow = nrow(coefs))
+           fd(coef = coefs + uniform_noise, basisobj = fd_obj$basis)
+         },
+         "laplace" = {
+           params <- list(...)
+           mu <- params$mu
+           sigma <- params$sigma
+           laplace_noise <- matrix(rlaplace(ncol(coefs) * nrow(coefs), location = mu, scale = sigma), nrow = nrow(coefs))
+           fd(coef = coefs + laplace_noise, basisobj = fd_obj$basis)
+         },
+         "exponential" = {
+           params <- list(...)
+           rate <- params$rate
+           exponential_noise <- matrix(rexp(ncol(coefs) * nrow(coefs), rate = rate), nrow = nrow(coefs))
+           fd(coef = coefs + exponential_noise, basisobj = fd_obj$basis)
+         }
+  )
+}
+
+# ------------------------------
+# 3. Ranking Methods Implementation
+# ------------------------------
+
+# 3.1 FPCA Method
+fpca_ranking_improved <- function(fd_obj) {
+  if (!require(fda)) stop("Package 'fda' is required.")
+  num_samples <- ncol(fd_obj$coefs)
+  fdPar_obj <- fdPar(fd_obj$basis, Lfdobj = 2, lambda = 1e-4) 
+  pca_res <- pca.fd(fd_obj, nharm = nrow(fd_obj$coefs), harmfdPar = fdPar_obj, centerfns = TRUE)
+  
+  explained_var <- pca_res$varprop
+  cum_var <- cumsum(explained_var)
+  n_components <- max(which(cum_var >= 0.8)[1], 1)
+  
+  pc_scores <- pca_res$scores[, 1:n_components, drop = FALSE]
+  const_fd <- fd(1, create.constant.basis(fd_obj$basis$rangeval))
+  mean_values <- inprod(fd_obj, const_fd)
+  
+  pc1_scores <- pc_scores[, 1]
+  # Align sign with mean values
+  if (sign(cor(pc1_scores, mean_values)) < 0) pc1_scores <- -pc1_scores
+  ranks <- rank(pc1_scores)
+  
+  return(list(scores = pc1_scores, ranks = ranks))
+}
+
+# 3.2 Weighted Linear Rank (WLR) - Original
+wlr <- function(fd_obj) {
+  data_matrix <- t(fd_obj$coefs)  
+  T_len <- ncol(data_matrix)    
+  num_samples <- nrow(data_matrix)   
+  total_scores <- numeric(num_samples)   
+  
+  find_intersection_points <- function(data_mat) {
+    intersections <- c()
+    num_curves <- nrow(data_mat)
+    for (i_curve in 1:(num_curves - 1)) {
+      for (j_curve in (i_curve + 1):num_curves) {
+        diff_curve <- data_mat[i_curve, ] - data_mat[j_curve, ]
+        intersections <- c(intersections, which(diff_curve[-1] * diff_curve[-length(diff_curve)] < 0) + 1)  
+      }
+    }
+    return(unique(intersections))
+  }
+  
+  intersections <- find_intersection_points(data_matrix)
+  m <- length(intersections) 
+  segment_boundaries <- c(1, intersections, T_len)  
+  segment_boundaries <- sort(unique(segment_boundaries))
+  
+  total_length <- segment_boundaries[length(segment_boundaries)] - segment_boundaries[1]
+  weights <- numeric(length(segment_boundaries) - 1)
+  for (segment_idx in 1:(length(segment_boundaries) - 1)) {
+    weights[segment_idx] <- (segment_boundaries[segment_idx + 1] - segment_boundaries[segment_idx]) / total_length
+  }
+  
+  segment_ranks <- matrix(0, nrow = num_samples, ncol = length(weights))
+  for (segment_idx in 1:(length(segment_boundaries) - 1)) {
+    start_pt <- segment_boundaries[segment_idx]
+    end_pt <- segment_boundaries[segment_idx + 1]
+    start_pt <- max(1, start_pt) 
+    end_pt <- min(end_pt, T_len) 
+    if (start_pt > end_pt) next 
+    
+    segment_data <- data_matrix[, start_pt:end_pt]
+    segment_means <- rowMeans(segment_data, na.rm = TRUE)
+    segment_ranks[, segment_idx] <- rank(segment_means, ties.method = "average")
+    total_scores <- total_scores + weights[segment_idx] * segment_ranks[, segment_idx]
+  }
+  
+  return(list(scores = total_scores, ranks = rank(total_scores, ties.method = "average")))
+}
+
+# -----------------------------------------------------------
+# 3.3 FP-OWA 
+# -----------------------------------------------------------
+
+# --- FP-OWA Helper Functions ---
+.safe_prcomp <- function(X, pcs = 3, eps = 1e-12) {
+  sds <- apply(X, 2, sd, na.rm = TRUE)
+  keep <- which(sds > eps)
+  if (length(keep) == 0) stop("Zero variance in features, PCA failed.")
+  X2 <- scale(X[, keep, drop = FALSE], center = TRUE, scale = TRUE)
+  rnk <- qr(X2)$rank
+  pcs_eff <- max(1, min(pcs, ncol(X2), rnk))
+  prcomp(X2, center = FALSE, scale. = FALSE, rank. = pcs_eff)
+}
+
+.k_distance_elbow <- function(Z, k = 4, print_plot = TRUE) {
+  dm <- as.matrix(dist(Z))
+  k_safe <- min(k, max(1, nrow(Z) - 2))
+  kdist <- apply(dm, 1, function(x) sort(x)[k_safe + 1])
+  kdist_sorted <- sort(kdist)
+  n <- length(kdist_sorted)
+  x <- seq_along(kdist_sorted)
+  y <- kdist_sorted
+  
+  span_val <- max(0.1, min(1, 10/n)) 
+  y_smooth <- tryCatch(
+    suppressWarnings(loess(y ~ x, span = span_val)$fitted),
+    error = function(e) y 
+  )
+  if(length(y_smooth) != n) y_smooth <- y
+  
+  dy1 <- diff(y_smooth) / diff(x)
+  dy2 <- diff(dy1) / diff(x[1:(n-1)])
+  curvature <- abs(dy2) / (1 + dy1[-length(dy1)]^2)^(3/2)
+  id <- max(2, which.max(curvature) + 1)  
+  elbow <- y_smooth[id]  
+  
+  p <- NULL
+  if (print_plot) {
+    # Plotting code omitted for brevity in batch runs
+  }
+  list(elbow = elbow, plot = p, kdist = kdist)
+}
+
+.find_best_dbscan <- function(Z, eps_range, minPts_range, prefer_nc = 3) {
+  D <- dist(Z)
+  best <- list(eps = NA_real_, minPts = NA_integer_, sil = -Inf, nc = NA_integer_)
+  for (eps in eps_range) for (mp in minPts_range) {
+    mp_safe <- min(mp, nrow(Z))
+    fit <- tryCatch(dbscan(Z, eps = eps, minPts = mp_safe), error = function(e) NULL)
+    if (is.null(fit)) next
+    
+    labs <- fit$cluster
+    nc   <- length(unique(labs[labs > 0]))
+    sc <- if (nc >= 2) {
+      suppressWarnings(tryCatch(mean(silhouette(labs, D)[, 3], na.rm = TRUE), error = function(e) NA_real_))
+    } else if (nc == 1) -1000 else NA_real_
+    score <- ifelse(is.na(sc), -9999 - abs(nc - prefer_nc), sc)
+    if (score > ifelse(is.na(best$sil), -9999 - abs(best$nc - prefer_nc), best$sil)) {
+      best <- list(eps = eps, minPts = mp, sil = sc, nc = nc)
+    }
+  }
+  best
+}
+
+# --- FP-OWA Main Function ---
+FPOWA_modified <- function(fd_obj,
+                            t_length = 100,
+                            lambda_candidates = 10^seq(-6, 0, length.out = 10),
+                            pcs = 3,
+                            feat_gamma = 2,   
+                            feat_delta = 0.5, 
+                            xi  = 0.05,
+                            min_segment_prop = 0.03,
+                            use_dbscan_first = TRUE,
+                            sa_plot_elbow   = FALSE, 
+                            sa_plot_heatmap = FALSE, 
+                            sa_k_for_knn    = 4,
+                            sa_eps_points   = 60,
+                            sa_minPts_from  = NULL,
+                            sa_minPts_to    = NULL,
+                            sa_minPts_by    = 1,
+                            sa_metric       = "num_clusters") {
+  
+  # 1) Smoothing
+  t_grid <- seq(fd_obj$basis$rangeval[1], fd_obj$basis$rangeval[2], length.out = t_length)
+  raw_mat <- eval.fd(t_grid, fd_obj)
+  basis <- fd_obj$basis
+  gcv <- numeric(length(lambda_candidates)); fds <- vector("list", length(lambda_candidates))
+  for (i in seq_along(lambda_candidates)) {
+    fdPar_obj <- fdPar(basis, Lfdobj = 2, lambda = lambda_candidates[i])
+    s <- smooth.basis(t_grid, raw_mat, fdPar_obj)
+    fds[[i]] <- s$fd
+    gcv[i] <- if (length(s$gcv) > 1) mean(s$gcv) else s$gcv
+  }
+  smooth_fd <- fds[[which.min(gcv)]]
+  
+  # 2) Feature Extraction
+  val_mat <- eval.fd(t_grid, smooth_fd) 
+  dt  <- mean(diff(t_grid))
+  d1  <- rbind(diff(val_mat)/dt, 0)
+  d2  <- rbind(diff(d1)/dt, 0)
+  feats <- cbind(scale(val_mat), feat_gamma * scale(d1), feat_delta * scale(d2))
+  feats[is.na(feats)] <- 0
+  pc <- .safe_prcomp(feats, pcs = pcs)
+  Z  <- pc$x
+  n_t <- nrow(Z) 
+  
+  # 3) Auto-Parameter Selection
+  elbow_res <- .k_distance_elbow(Z, k = min(sa_k_for_knn, max(1, n_t - 2)), print_plot = sa_plot_elbow)
+  
+  Z <- as.matrix(Z); Z <- Z[, apply(Z, 2, sd) > 1e-8, drop = FALSE]
+  dm <- as.matrix(dist(Z))
+  kdist <- apply(dm, 1, function(x) sort(x)[min(sa_k_for_knn, max(1, n_t - 2)) + 1])
+  rng <- suppressWarnings(quantile(kdist, probs = c(0.10, 0.95), na.rm = TRUE))
+  eps_low  <- ifelse(is.finite(rng[1]), max(1e-8, rng[1]), 0.1)
+  eps_high <- ifelse(is.finite(rng[2]), max(eps_low + 1e-8, rng[2]), 5)
+  if (eps_high <= eps_low) { eps_low <- 0.1; eps_high <- 5 }
+  eps_range <- seq(eps_low, eps_high, length.out = sa_eps_points)
+  
+  min_to_default <- max(5, floor(n_t * 0.25))
+  min_to <- if (is.null(sa_minPts_to)) min_to_default else sa_minPts_to
+  min_to <- min(min_to, max(2, n_t - 2)) 
+  min_from <- if(is.null(sa_minPts_from)) 3 else sa_minPts_from
+  min_from <- min(min_from, min_to)
+  minPts_range <- seq(min_from, min_to, by = sa_minPts_by)
+  
+  best_db <- .find_best_dbscan(Z, eps_range, minPts_range, prefer_nc = 3)
+  
+  # 5) Segmentation
+  use_method <- "DBSCAN"; labs <- NULL
+  if (use_dbscan_first && !is.na(best_db$eps)) {
+    fit <- tryCatch(dbscan(Z, eps = best_db$eps, minPts = best_db$minPts), error = function(e) NULL)
+    if(!is.null(fit)) {
+      labs <- fit$cluster
+      if (length(unique(labs[labs > 0])) < 2) use_method <- "OPTICS"
+    } else use_method <- "OPTICS"
+  } else use_method <- "OPTICS"
+  
+  if (use_method == "OPTICS") {
+    opt_minPts <- min(max(3, floor(n_t/10)), max(2, n_t - 2))
+    opt <- tryCatch(optics(Z, minPts = opt_minPts), error = function(e) NULL)
+    if(!is.null(opt)) {
+      labs <- extractXi(opt, xi = xi)$cluster
+      if (length(unique(labs[labs > 0])) < 2) labs <- rep(1L, nrow(Z))
+    } else labs <- rep(1L, nrow(Z))
+  }
+  
+  # Smooth noise labels
+  for (i in seq_along(labs)) {
+    if (labs[i] == 0) {
+      if (i > 1 && labs[i-1] != 0) labs[i] <- labs[i-1]
+      else if (i < length(labs) && labs[i+1] != 0) labs[i] <- labs[i+1]
+      else labs[i] <- 1
+    }
+  }
+  
+  # 6) Define Boundaries
+  boundary_idx <- which(labs[-1] != labs[-length(labs)])
+  seg_points <- sort(unique(c(t_grid[1], t_grid[boundary_idx + 1], t_grid[length(t_grid)])))
+  if (length(seg_points) > 2) {
+    min_len <- min_segment_prop * diff(range(t_grid))
+    keep <- c(TRUE, diff(seg_points) >= min_len)
+    seg_points <- seg_points[c(TRUE, keep[-length(keep)])]
+    seg_points[1] <- t_grid[1]; seg_points[length(seg_points)] <- tail(t_grid, 1)
+    seg_points <- sort(unique(seg_points))
+  }
+  
+  # 7) Weighting and Scoring
+  n_segments <- max(1, length(seg_points) - 1)
+  mbd_weights <- numeric(n_segments)
+  n_samples <- ncol(smooth_fd$coefs)
+  segment_ranks <- matrix(0, nrow = n_samples, ncol = n_segments)
+  
+  for (i in 1:n_segments) {
+    seg_data <- window_fd(smooth_fd, seg_points[i], seg_points[i + 1])
+    mbd_vals <- tryCatch(MBD(seg_data), error = function(e) rep(0, ncol(seg_data$coefs)))
+    mbd_weights[i] <- mean(mbd_vals, na.rm = TRUE)
+    
+    basis_i  <- seg_data$basis
+    a <- seg_points[i]; b <- seg_points[i + 1]
+    basis_integrals <- inprod(basis_i, basis_i, Lfdobj1 = 0, Lfdobj2 = 0, rng = c(a, b))
+    diag_integrals  <- diag(basis_integrals)
+    integrals <- colSums(seg_data$coefs * diag_integrals)
+    segment_ranks[, i] <- rank(integrals, ties.method = "average")
+  }
+  mbd_weights[is.na(mbd_weights)] <- 0
+  if (sum(mbd_weights) == 0) mbd_weights <- rep(1/n_segments, n_segments) else mbd_weights <- mbd_weights / sum(mbd_weights)
+  scores <- as.numeric(segment_ranks %*% mbd_weights)
+  
+  list(scores = scores, seg_points = seg_points, labs = labs)
+}
+
+# 3.4 h-mode Depth
+hmode_ranking <- function(fd_obj, t_length = 100) {
+  t_grid <- seq(fd_obj$basis$rangeval[1], fd_obj$basis$rangeval[2], length.out = t_length)
+  data_mat <- t(eval.fd(t_grid, fd_obj)) 
+  f_data <- fdata(data_mat, argvals = t_grid)
+  d_mode <- depth.mode(f_data)
+  scores <- as.numeric(d_mode$dep)
+  return(list(scores = scores, ranks = rank(scores)))
+}
+
+# 3.5 Random Tukey Depth
+rtd_ranking <- function(fd_obj, t_length = 100) {
+  t_grid <- seq(fd_obj$basis$rangeval[1], fd_obj$basis$rangeval[2], length.out = t_length)
+  data_mat <- t(eval.fd(t_grid, fd_obj))
+  f_data <- fdata(data_mat, argvals = t_grid)
+  d_rt <- depth.RT(f_data, n.proj = 50, seed = 123)
+  scores <- as.numeric(d_rt$dep)
+  return(list(scores = scores, ranks = rank(scores)))
+}
+
+# ------------------------------
+# 4. Evaluation Metrics
+# ------------------------------
+evaluate_ranking <- function(true_ranks, pred_scores, true_integrals = NULL) {
+  true_ranks <- as.numeric(true_ranks)
+  pred_scores <- as.numeric(pred_scores)
+  pred_ranks <- rank(pred_scores, ties.method = "average")
+  
+  kendall_tau <- cor(true_ranks, pred_scores, method = "kendall")
+  spearman_rho <- cor(true_ranks, pred_scores, method = "spearman")
+  mard <- mean(abs(true_ranks - pred_ranks))
+  
+  n <- length(true_ranks)
+  top_cutoff <- ceiling(n * 0.25)
+  bottom_cutoff <- ceiling(n * 0.75)
+  
+  true_top <- which(true_ranks <= top_cutoff)
+  pred_top <- which(pred_ranks <= top_cutoff)
+  top_consistency <- length(intersect(true_top, pred_top)) / top_cutoff
+  
+  true_bottom <- which(true_ranks >= bottom_cutoff)
+  pred_bottom <- which(pred_ranks >= bottom_cutoff)
+  bottom_consistency <- length(intersect(true_bottom, pred_bottom)) / (n - bottom_cutoff + 1)
+  
+  result <- list(
+    kendall_tau = kendall_tau,
+    spearman_rho = spearman_rho,
+    mard = mard,
+    top_consistency = top_consistency,
+    bottom_consistency = bottom_consistency
+  )
+  
+  if(!is.null(true_integrals)) {
+    # Normalize scores for RMSE/MAE comparison
+    pred_scores_norm <- (pred_scores - min(pred_scores)) / 
+      (max(pred_scores) - min(pred_scores)) * (max(true_integrals) - min(true_integrals)) + 
+      min(true_integrals)
+    
+    rmse <- sqrt(mean((true_integrals - pred_scores_norm)^2))
+    mae <- mean(abs(true_integrals - pred_scores_norm))
+    
+    result$integral_rmse <- rmse
+    result$integral_mae <- mae
+  }
+  
+  return(result)
+}
+
+# ------------------------------
+# 5. Parallel Simulation
+# ------------------------------
+run_simulation <- function(n_runs = 500, sample_size = 100, noise_type = "spike", noise_params = list(ratio = 0.01), t_length = 30, parallel_cores = detectCores() - 1) {
+  
+  cl <- makeCluster(parallel_cores)
+  registerDoParallel(cl)
+  clusterSetRNGStream(cl, 123)
+  
+  # Export necessary functions and libraries to workers
+  clusterExport(cl, varlist = c("generate_functional_data", "add_pollution", "FPOWA_modified", 
+                                "wlr", "fpca_ranking_improved", "hmode_ranking", "rtd_ranking",
+                                "evaluate_ranking", "window_fd", 
+                                ".safe_prcomp", ".k_distance_elbow", ".dbscan_heatmap", ".find_best_dbscan"), envir = .GlobalEnv)
+  
+  clusterEvalQ(cl, {
+    library(fda); library(dtwclust); library(cluster); library(roahd); library(ggplot2)
+    library(microbenchmark); library(rootSolve); library(dbscan); library(extraDistr)
+    library(LaplacesDemon); library(stringr); library(fda.usc); library(reshape2)
+  })
+  
+  cat(sprintf("Starting parallel simulation (Runs: %d, Cores: %d)...\n", n_runs, parallel_cores))
+  
+  results <- foreach(i = 1:n_runs, .combine = 'rbind', .packages = c("fda", "roahd", "dbscan", "fda.usc", "reshape2", "ggplot2", "cluster")) %dopar% {
+    data <- generate_functional_data(n = sample_size, t_length = t_length)
+    polluted_data <- do.call(add_pollution, c(list(fd_obj = data$clean, type = noise_type), noise_params))
+    
+    # Execution
+    time_FPOWA <- system.time({ 
+      FPOWA_res <- FPOWA_modified(
+        polluted_data, t_length = t_length, sa_plot_elbow = FALSE, sa_plot_heatmap = FALSE,
+        feat_gamma = 0, feat_delta = 0, pcs = 2, xi = 0.01 # Params optimized for t=30
+      ) 
+    })["elapsed"]
+    
+    time_wlr    <- system.time({ wlr_res    <- wlr(polluted_data) })["elapsed"]
+    time_fpca   <- system.time({ fpca_res   <- fpca_ranking_improved(polluted_data) })["elapsed"]
+    time_hmode  <- system.time({ hmode_res  <- hmode_ranking(polluted_data) })["elapsed"]
+    time_rtd    <- system.time({ rtd_res    <- rtd_ranking(polluted_data) })["elapsed"]
+    
+    # Evaluation
+    FPOWA_metrics <- evaluate_ranking(data$true_rank, FPOWA_res$scores, data$true_integrals)
+    wlr_metrics    <- evaluate_ranking(data$true_rank, wlr_res$scores, data$true_integrals)
+    fpca_metrics   <- evaluate_ranking(data$true_rank, fpca_res$scores, data$true_integrals)
+    hmode_metrics  <- evaluate_ranking(data$true_rank, hmode_res$scores, data$true_integrals)
+    rtd_metrics    <- evaluate_ranking(data$true_rank, rtd_res$scores, data$true_integrals)
+    
+    rbind(
+      data.frame(run = i, method = "FPOWA", efsrwm_metrics, runtime = time_efsrwm),
+      data.frame(run = i, method = "WLR", wlr_metrics, runtime = time_wlr),
+      data.frame(run = i, method = "FPCA", fpca_metrics, runtime = time_fpca),
+      data.frame(run = i, method = "HMode", hmode_metrics, runtime = time_hmode),
+      data.frame(run = i, method = "RTD", rtd_metrics, runtime = time_rtd)
+    )
+  }
+  
+  stopCluster(cl)
+  return(results)
+}
+
+
 
